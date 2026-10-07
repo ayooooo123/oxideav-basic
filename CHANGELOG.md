@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rawvideo` decoder implements `Decoder::output_video_dimensions` /
+  `output_pixel_format`: the stream's `width` × `height` and pixel format,
+  which every frame has.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-basic/compare/v0.0.9...v0.0.10) - 2026-08-18
 
 ### Other

@@ -39,9 +39,12 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
-/// Validated picture geometry: per image plane `(row_bytes, rows)`.
+/// Validated picture geometry: the format, the picture size, and per
+/// image plane `(row_bytes, rows)`.
 #[derive(Debug, Clone)]
 struct Layout {
+    format: PixelFormat,
+    size: (u32, u32),
     planes: Vec<(usize, usize)>,
     frame_bytes: usize,
 }
@@ -85,6 +88,8 @@ impl Layout {
             planes.push((row, rows));
         }
         Ok(Self {
+            format: fmt,
+            size: (w, h),
             planes,
             frame_bytes,
         })
@@ -162,6 +167,15 @@ impl Decoder for RawVideoDecoder {
             pts: pkt.pts,
             planes,
         }))
+    }
+
+    /// Every frame has the stream's geometry: a raw payload carries none.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        Some(self.layout.size)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        Some(self.layout.format)
     }
 
     fn flush(&mut self) -> Result<()> {
