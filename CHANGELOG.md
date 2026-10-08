@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WAV: audio coded in blocks of several samples (ADPCM, DV audio, MP3,
+  WMA, …) is packetized and timed as FFmpeg's wavdec and demuxer layer do:
+  about 100 ms of whole blocks a packet (`ff_pcm_default_packet_size`),
+  each packet's pts and duration in samples where the format fixes them
+  (`get_audio_frame_duration`: IMA and MS ADPCM, Yamaha/OKI, G.726, WMA),
+  else only the first packet after open or a seek timed; seeks by the byte
+  rate (`ff_pcm_read_seek`); duration from the `fact` count or the byte
+  rate; bit rate from `nAvgBytesPerSec`. Each block was timed as one
+  sample, so packets after the first 1024 blocks were stamped far too
+  early.
+
 ### Added
 
 - `rawvideo` decoder implements `Decoder::output_video_dimensions` /

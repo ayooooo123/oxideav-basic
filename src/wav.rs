@@ -1102,21 +1102,33 @@ pub fn open_wav_demuxer_with(
     // the two should agree; when they don't we surface
     // `wav:fact.mismatch` so a downstream tool can flag the file rather
     // than silently trusting one number over the other.
-    let total_samples = if let Some(fc) = fact_sample_count {
+    let block_coded = BlockCoded::new(&codec_id, &fmt);
+    let total_samples = if block_coded.is_some() {
+        // wav_read_header for block-coded audio: the fact count, unless
+        // the codec has exact bits a sample (or there is none); then
+        // data bits over channels times bits a sample, where known.
+        let mut count = fact_sample_count.filter(|_| exact_bits_per_sample(&codec_id) == 0);
+        let bps = bits_per_sample(&codec_id);
+        if count.is_none() && fmt.channels > 0 && data_size > 0 && bps > 0 {
+            count = Some((data_size << 3) / (u64::from(fmt.channels) * bps));
+        }
+        count
+    } else if let Some(fc) = fact_sample_count {
         if fc != block_samples {
             metadata.push((
                 "wav:fact.mismatch".to_string(),
                 format!("block_samples={block_samples} fact_samples={fc}"),
             ));
         }
-        fc
+        Some(fc)
     } else {
-        block_samples
+        Some(block_samples)
     };
-    let duration_micros: i64 = if fmt.sample_rate > 0 {
-        (total_samples as i128 * 1_000_000 / fmt.sample_rate as i128) as i64
-    } else {
-        0
+    let duration_micros: i64 = match (total_samples, &block_coded) {
+        (Some(n), _) if fmt.sample_rate > 0 => (n as i128 * 1_000_000 / fmt.sample_rate as i128) as i64,
+        // FFmpeg's estimate from the bit rate.
+        (None, Some(bc)) if bc.byte_rate > 0 => (data_size as i128 * 1_000_000 / bc.byte_rate as i128) as i64,
+        _ => 0,
     };
 
     let mut params = CodecParameters::audio(codec_id);
@@ -1136,7 +1148,11 @@ pub fn open_wav_demuxer_with(
     // bit_rate uses the on-wire bytes_per_second (== block_align *
     // sample_rate) — for A-law/μ-law that's 8 * channels * rate, NOT
     // the post-decode S16 rate.
-    params.bit_rate = Some(8 * block_align * (fmt.sample_rate as u64));
+    params.bit_rate = Some(match &block_coded {
+        // ff_get_wav_header: nAvgBytesPerSec * 8.
+        Some(bc) => bc.byte_rate * 8,
+        None => 8 * block_align * (fmt.sample_rate as u64),
+    });
 
     // Round-77 metadata: surface WAVEFORMATEXTENSIBLE side-info under
     // the same key shape `oxideav-avi` uses (without the per-stream
@@ -1213,7 +1229,7 @@ pub fn open_wav_demuxer_with(
     let stream = StreamInfo {
         index: 0,
         time_base,
-        duration: Some(total_samples as i64),
+        duration: total_samples.map(|n| n as i64),
         start_time: Some(0),
         params,
     };
@@ -1232,6 +1248,8 @@ pub fn open_wav_demuxer_with(
         block_align,
         chunk_frames: 1024,
         samples_emitted: 0,
+        block_coded,
+        next_pts: Some(0),
         metadata,
         duration_micros,
         format_tag: fmt.format_tag,
@@ -4739,6 +4757,118 @@ fn fmt_loudness(v: i16) -> String {
 }
 
 #[derive(Clone, Debug)]
+/// How FFmpeg's wavdec and demuxer layer packetize and time audio coded in
+/// blocks of several samples (anything but PCM and G.711).
+struct BlockCoded {
+    codec: String,
+    channels: u64,
+    sample_rate: u64,
+    block_align: u64,
+    bits_per_coded_sample: u64,
+    /// nAvgBytesPerSec.
+    byte_rate: u64,
+    /// ff_pcm_default_packet_size, as wav_read_packet rounds it.
+    packet_bytes: u64,
+}
+
+impl BlockCoded {
+    fn new(codec: &CodecId, fmt: &WaveFmt) -> Option<Self> {
+        let id = codec.as_str();
+        if id.starts_with("pcm_") || id.starts_with("wav:") {
+            return None;
+        }
+        let (channels, sample_rate) = (u64::from(fmt.channels), u64::from(fmt.sample_rate));
+        let block_align = u64::from(fmt.block_align).max(1);
+        let byte_rate = u64::from(fmt.byte_rate);
+        // ff_pcm_default_packet_size
+        let max_samples = (i32::MAX as u64 / block_align).max(1);
+        let bps = bits_per_sample(codec);
+        let mut bit_rate = byte_rate * 8;
+        if bps > 0 && sample_rate > 0 && channels > 0 {
+            bit_rate = bps * sample_rate * channels;
+        }
+        let nb = if bit_rate > 0 {
+            let n = (bit_rate / 8 / PCM_DEMUX_TARGET_FPS / block_align).clamp(1, max_samples);
+            1 << (63 - n.leading_zeros())
+        } else {
+            (4096 / block_align).clamp(1, max_samples)
+        };
+        let max_size = block_align * nb;
+        // wav_read_packet: at least a block, in whole blocks.
+        let packet_bytes = if block_align > 1 { max_size.max(block_align) / block_align * block_align } else { max_size };
+        Some(Self {
+            codec: id.to_string(),
+            channels,
+            sample_rate,
+            block_align,
+            bits_per_coded_sample: u64::from(fmt.bits_per_sample),
+            byte_rate,
+            packet_bytes: packet_bytes.max(1),
+        })
+    }
+
+    /// get_audio_frame_duration for a packet of `frame_bytes`, for the
+    /// codecs where the samples follow from the bytes alone; None where
+    /// only the decoder knows (FFmpeg's per-frame and frame_size rules).
+    fn duration(&self, frame_bytes: u64) -> Option<i64> {
+        let (ch, ba, bps) = (self.channels, self.block_align, self.bits_per_coded_sample);
+        let exact = exact_bits_per_sample(&CodecId::new(&self.codec));
+        let samples = if exact > 0 && ch > 0 {
+            frame_bytes * 8 / (exact * ch)
+        } else {
+            let blocks = frame_bytes / ba;
+            match self.codec.as_str() {
+                "adpcm_g726" if bps > 0 => frame_bytes * 8 / bps,
+                "adpcm_ima_wav" if ch > 0 && (2..=5).contains(&bps) && ba >= 4 * ch => {
+                    blocks * (1 + (ba - 4 * ch) / (bps * ch) * 8)
+                }
+                "adpcm_ms" if ch > 0 && ba >= 7 * ch => blocks * (2 + (ba - 7 * ch) * 2 / ch),
+                "wmav1" | "wmav2" if self.byte_rate > 0 && self.sample_rate > 0 && ba > 1 => {
+                    frame_bytes * 8 * self.sample_rate / (self.byte_rate * 8)
+                }
+                _ => 0,
+            }
+        };
+        (samples > 0).then(|| samples.min(i32::MAX as u64) as i64)
+    }
+
+    /// ff_pcm_read_seek, rounding down: the byte offset of the block the
+    /// byte rate puts `pts` in (within `data_len`) and its pts.
+    fn seek(&self, pts: i64, data_len: u64) -> Result<(u64, i64)> {
+        if self.byte_rate == 0 || self.sample_rate == 0 {
+            return Err(Error::unsupported("WAV: no byte rate to seek by"));
+        }
+        let pts = pts as u128;
+        let block = (pts * u128::from(self.byte_rate) / (u128::from(self.sample_rate) * u128::from(self.block_align))) as u64;
+        let last = data_len.saturating_sub(1) / self.block_align;
+        let pos = block.min(last) * self.block_align;
+        // av_rescale: rounded to nearest, halves up.
+        let den = u128::from(self.byte_rate);
+        let pts = ((u128::from(pos) * u128::from(self.sample_rate) + den / 2) / den) as i64;
+        Ok((pos, pts))
+    }
+}
+
+/// PCM_DEMUX_TARGET_FPS (libavformat/pcm.h).
+const PCM_DEMUX_TARGET_FPS: u64 = 10;
+
+/// av_get_exact_bits_per_sample for the block-coded codecs a WAV can
+/// carry here (0 for the others).
+fn exact_bits_per_sample(codec: &CodecId) -> u64 {
+    match codec.as_str() {
+        "adpcm_yamaha" | "adpcm_dialogic" | "adpcm_ima_oki" => 4,
+        _ => 0,
+    }
+}
+
+/// av_get_bits_per_sample for them.
+fn bits_per_sample(codec: &CodecId) -> u64 {
+    match codec.as_str() {
+        "adpcm_ima_wav" | "adpcm_ms" => 4,
+        _ => exact_bits_per_sample(codec),
+    }
+}
+
 struct WaveFmt {
     format_tag: u16,
     channels: u16,
@@ -5024,6 +5154,11 @@ pub struct WavDemuxer {
     block_align: u64,
     chunk_frames: u64,
     samples_emitted: i64,
+    /// Packet sizes and timing of block-coded audio (ADPCM, DV audio, …);
+    /// None for PCM, whose blocks are sample frames.
+    block_coded: Option<BlockCoded>,
+    /// The pts of the next block-coded packet, where it is known.
+    next_pts: Option<i64>,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
     format_tag: u16,
@@ -5238,6 +5373,28 @@ impl Demuxer for WavDemuxer {
             return Err(Error::Eof);
         }
         let remaining = self.data_end - self.cursor;
+        if let Some(bc) = &self.block_coded {
+            // wav_read_packet: max_size bytes (whole blocks), or what is
+            // left; timed by its samples where the format fixes them.
+            let want = bc.packet_bytes.min(remaining);
+            self.input.seek(SeekFrom::Start(self.cursor))?;
+            let mut buf = Vec::with_capacity(want as usize);
+            (&mut *self.input).take(want).read_to_end(&mut buf)?;
+            if buf.is_empty() {
+                return Err(Error::Eof);
+            }
+            self.cursor += buf.len() as u64;
+            let duration = bc.duration(buf.len() as u64);
+            let pts = self.next_pts;
+            self.next_pts = pts.zip(duration).map(|(p, d)| p + d);
+            let stream = &self.streams[0];
+            let mut pkt = Packet::new(0, stream.time_base, buf);
+            pkt.pts = pts;
+            pkt.dts = pts;
+            pkt.duration = duration;
+            pkt.flags.keyframe = true;
+            return Ok(pkt);
+        }
         let want_bytes = (self.chunk_frames * self.block_align).min(remaining);
         let want_bytes = (want_bytes / self.block_align) * self.block_align;
         if want_bytes == 0 {
@@ -5268,6 +5425,15 @@ impl Demuxer for WavDemuxer {
             return Err(Error::invalid(format!(
                 "WAV: stream index {stream_index} out of range"
             )));
+        }
+        if let Some(bc) = &self.block_coded {
+            // ff_pcm_read_seek (AVSEEK_FLAG_BACKWARD): the block the byte
+            // rate puts the target in; the next packet is timed from it.
+            let (pos, pts) = bc.seek(pts.max(0), self.data_end - self.data_offset)?;
+            self.cursor = self.data_offset + pos;
+            self.input.seek(SeekFrom::Start(self.cursor))?;
+            self.next_pts = Some(pts);
+            return Ok(pts);
         }
         // PCM is keyframe-only and frame-aligned: the target pts is a
         // sample-index offset into the data chunk. Clamp to the valid
