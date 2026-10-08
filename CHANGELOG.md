@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- WAV also hands the decoder wBitsPerSample, as `ff_get_wav_header` sets
+  `bits_per_coded_sample`: `options["bits_per_coded_sample"]`. G.726 takes
+  its rate from it (a 16, 24 or 40 kbit/s file decoded at 32 kbit/s, with
+  the wrong sample count).
 - WAV hands the decoder the fmt chunk's codec bytes and nBlockAlign as
   FFmpeg's `ff_get_wav_header` does: `extradata` is the cbSize bytes after
   WAVEFORMATEX (after the 22-byte extension of WAVEFORMATEXTENSIBLE, after

@@ -1166,8 +1166,11 @@ pub fn open_wav_demuxer_with(
 
     let mut params = CodecParameters::audio(codec_id);
     params.tag = Some(oxideav_core::CodecTag::wave_format(fmt.format_tag));
-    // ff_get_wav_header hands the decoder nBlockAlign and the codec bytes.
+    // ff_get_wav_header hands the decoder nBlockAlign, wBitsPerSample (its
+    // bits_per_coded_sample: G.726's code width, IMA ADPCM's bit depth) and
+    // the codec bytes.
     params.options.insert("block_align", fmt.block_align.to_string());
+    params.options.insert("bits_per_coded_sample", fmt.bits_per_sample.to_string());
     params.extradata = fmt.extradata.clone();
     params.channels = Some(fmt.channels);
     params.sample_rate = Some(fmt.sample_rate);
