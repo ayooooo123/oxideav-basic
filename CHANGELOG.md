@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- WAV hands the decoder the fmt chunk's codec bytes and nBlockAlign as
+  FFmpeg's `ff_get_wav_header` does: `extradata` is the cbSize bytes after
+  WAVEFORMATEX (after the 22-byte extension of WAVEFORMATEXTENSIBLE, after
+  the 12-byte HEAACWAVEINFO of HEAACWAVEFORMAT), clamped to the chunk, and
+  `options["block_align"]` is nBlockAlign (ATRAC3 failed with "unknown
+  extradata size 0"; ADPCM and DV audio lacked their block size).
+  EXTENSIBLE subformats resolve as FFmpeg's `parse_waveformatex`: a tag in
+  the first 32 bits of any of its three base GUIDs (the ambisonic and the
+  byte-shifted one too), and the codec GUIDs of `ff_codec_wav_guids`
+  (ATRAC3plus, ATRAC9, AC-3, E-AC-3, MP2, AGM ADPCM, DFPWM).
+
 - WAV: audio coded in blocks of several samples (ADPCM, DV audio, MP3,
   WMA, …) is packetized and timed as FFmpeg's wavdec and demuxer layer do:
   about 100 ms of whole blocks a packet (`ff_pcm_default_packet_size`),
@@ -22,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- PCM decoders for the ids MOV, CAF, MXF, OMA and AIFF carry:
+  `pcm_s16be`, `pcm_s24be`, `pcm_s32be`, `pcm_f32be`, `pcm_f64be`,
+  `pcm_u16le`/`be`, `pcm_u24le`/`be`, `pcm_u32le`/`be` (to the signed
+  little-endian formats), `pcm_s64le`/`be` (to 64-bit float) and
+  `pcm_s24daud` (D-Cinema words, to 16-bit as FFmpeg decodes them). Every
+  PCM decoder reports its output format (`output_audio_format`), so a
+  container's declared sample format no longer decides it.
 - `rawvideo` decoder implements `Decoder::output_video_dimensions` /
   `output_pixel_format`: the stream's `width` × `height` and pixel format,
   which every frame has.

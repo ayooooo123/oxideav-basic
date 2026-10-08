@@ -309,6 +309,8 @@ const FMT_IEEE_FLOAT: u16 = WAVE_FORMAT_IEEE_FLOAT;
 const FMT_ALAW: u16 = WAVE_FORMAT_ALAW;
 const FMT_MULAW: u16 = WAVE_FORMAT_MULAW;
 const FMT_EXTENSIBLE: u16 = WAVE_FORMAT_EXTENSIBLE;
+/// HEAACWAVEFORMAT (`mmreg.h` WAVE_FORMAT_MPEG_HEAAC).
+const WAVE_FORMAT_MPEG_HEAAC: u16 = 0x1610;
 
 // `KSDATAFORMAT_SUBTYPE_*` GUIDs (`KSMedia.h`). All follow the same
 // `<tag>-0000-0010-8000-00AA00389B71` "DataFormat" base where the
@@ -365,6 +367,37 @@ fn waveformatex_tag(g: &[u8; 16]) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// The WAVE tag in the first 32 bits of a SubFormat GUID on one of the
+/// three bases FFmpeg's `parse_waveformatex` (libavformat/riffdec.c)
+/// accepts: KSDATAFORMAT_SUBTYPE_WAVEFORMATEX's, the ambisonic B-format
+/// one, and the byte-shifted one some writers emit.
+fn base_guid_tag(g: &[u8; 16]) -> Option<u16> {
+    const BASES: [[u8; 12]; 3] = [
+        [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+        [0x21, 0x07, 0xD3, 0x11, 0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA],
+    ];
+    if !BASES.iter().any(|b| g[4..16] == b[..]) {
+        return None;
+    }
+    u16::try_from(u32::from_le_bytes([g[0], g[1], g[2], g[3]])).ok()
+}
+
+/// The codec a non-tag SubFormat GUID names (FFmpeg's
+/// `ff_codec_wav_guids`, libavformat/riff.c), by this registry's ids.
+fn guid_codec(g: &[u8; 16]) -> Option<&'static str> {
+    const GUIDS: [([u8; 16], &str); 7] = [
+        ([0x2C, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA], "ac3"),
+        ([0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44, 0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62], "atrac3plus"),
+        ([0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36, 0x8D, 0x4D, 0x88, 0xFC, 0x61, 0x65, 0x4F, 0x8C, 0x83, 0x6C], "atrac9"),
+        ([0xAF, 0x87, 0xFB, 0xA7, 0x02, 0x2D, 0xFB, 0x42, 0xA4, 0xD4, 0x05, 0xCD, 0x93, 0x84, 0x3B, 0xDD], "eac3"),
+        ([0x2B, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA], "mp2"),
+        ([0x82, 0xEC, 0x1F, 0x6A, 0xCA, 0xDB, 0x19, 0x45, 0xBD, 0xE7, 0x56, 0xD3, 0xB3, 0xEF, 0x98, 0x1D], "adpcm_agm"),
+        ([0x3A, 0xC1, 0xFA, 0x38, 0x81, 0x1D, 0x43, 0x61, 0xA4, 0x0D, 0xCE, 0x53, 0xCA, 0x60, 0x7C, 0xD1], "dfpwm"),
+    ];
+    GUIDS.iter().find(|(guid, _)| guid == g).map(|&(_, id)| id)
 }
 
 /// Format the 16-byte SubFormat GUID for diagnostic strings as
@@ -1133,6 +1166,9 @@ pub fn open_wav_demuxer_with(
 
     let mut params = CodecParameters::audio(codec_id);
     params.tag = Some(oxideav_core::CodecTag::wave_format(fmt.format_tag));
+    // ff_get_wav_header hands the decoder nBlockAlign and the codec bytes.
+    params.options.insert("block_align", fmt.block_align.to_string());
+    params.extradata = fmt.extradata.clone();
     params.channels = Some(fmt.channels);
     params.sample_rate = Some(fmt.sample_rate);
     params.sample_format = sample_fmt;
@@ -4890,6 +4926,9 @@ struct WaveFmt {
     channel_mask: Option<u32>,
     /// 16-byte SubFormat GUID. `None` outside EXTENSIBLE.
     subformat: Option<[u8; 16]>,
+    /// The codec bytes after the format structure (`ff_get_wav_header`'s
+    /// extradata).
+    extradata: Vec<u8>,
 }
 
 fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
@@ -4961,6 +5000,24 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
         channel_mask = Some(mask);
         subformat = Some(g);
     }
+    // ff_get_wav_header: cbSize bytes (clamped to the chunk) after
+    // WAVEFORMATEX, past the 22-byte extension of WAVEFORMATEXTENSIBLE or
+    // the 12-byte HEAACWAVEINFO of HEAACWAVEFORMAT.
+    let mut extradata = Vec::new();
+    if buf.len() >= 18 {
+        let mut at = 18;
+        let mut cb_size = usize::from(u16::from_le_bytes([buf[16], buf[17]])).min(buf.len() - 18);
+        let skip = match format_tag {
+            FMT_EXTENSIBLE => 22,
+            WAVE_FORMAT_MPEG_HEAAC => 12,
+            _ => 0,
+        };
+        if skip > 0 && cb_size >= skip {
+            at += skip;
+            cb_size -= skip;
+        }
+        extradata = buf[at..at + cb_size].to_vec();
+    }
     Ok(WaveFmt {
         format_tag,
         channels,
@@ -4971,6 +5028,7 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
         valid_bits_per_sample,
         channel_mask,
         subformat,
+        extradata,
     })
 }
 
@@ -5060,7 +5118,7 @@ fn resolve_codec(fmt: &WaveFmt, raw_fmt: &[u8], codecs: &dyn CodecResolver) -> R
     // ALAW 0x0006 / MULAW 0x0007) to every tag-derived GUID. The
     // recursion guard (`tag != FMT_EXTENSIBLE`) rejects the degenerate
     // GUID whose embedded tag is 0xFFFE itself.
-    if let Some(tag) = waveformatex_tag(&sub) {
+    if let Some(tag) = base_guid_tag(&sub) {
         if tag != FMT_EXTENSIBLE {
             if let Some(id) = codec_for_tag(tag, depth)? {
                 return Ok(id);
@@ -5072,6 +5130,9 @@ fn resolve_codec(fmt: &WaveFmt, raw_fmt: &[u8], codecs: &dyn CodecResolver) -> R
                 return Ok(id);
             }
         }
+    }
+    if let Some(id) = guid_codec(&sub) {
+        return Ok(CodecId::new(id));
     }
     // Not a (mappable) WAVEFORMATEX-template GUID — synthesise a
     // `wav:guid_<text>` id so downstream make_decoder fails naming the

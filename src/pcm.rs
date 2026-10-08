@@ -12,6 +12,15 @@
 //! - `pcm_f32le` — 32-bit IEEE float little-endian
 //! - `pcm_f64le` — 64-bit IEEE float little-endian
 //!
+//! Decoded only (containers such as MOV, CAF, MXF, OMA and AIFF carry
+//! them), to the formats above:
+//! - `pcm_s16be`, `pcm_s24be`, `pcm_s32be`, `pcm_f32be`, `pcm_f64be` —
+//!   big-endian
+//! - `pcm_u16le`/`be`, `pcm_u24le`/`be`, `pcm_u32le`/`be` — unsigned
+//!   (offset binary), to signed
+//! - `pcm_s64le`/`be` — signed 64-bit, to 64-bit float (full scale ±1.0)
+//! - `pcm_s24daud` — D-Cinema 24-bit words, to signed 16-bit
+//!
 //! Asterisk-style signed-linear aliases:
 //! - `slin`, `slin8`, `slin16`, `slin24`, `slin32`, `slin44`, `slin48`,
 //!   `slin96`, `slin192` — all map onto the `pcm_s16le` implementation.
@@ -20,8 +29,8 @@
 //!   they are indistinguishable from `pcm_s16le`.
 
 use oxideav_core::{
-    AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, MediaType,
-    Packet, ProbeContext, Result, SampleFormat, TimeBase,
+    AudioFormat, AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame,
+    MediaType, Packet, ProbeContext, Result, SampleFormat, TimeBase,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
@@ -101,6 +110,104 @@ pub fn register(reg: &mut CodecRegistry) {
                 .decoder(make_decoder)
                 .encoder(make_encoder),
         );
+    }
+
+    for &(id, format, _) in DECODE_ONLY {
+        let caps = CodecCapabilities::audio(format!("{id}_sw"))
+            .with_lossless(true)
+            .with_intra_only(true)
+            .with_sample_formats(vec![format]);
+        reg.register(CodecInfo::new(CodecId::new(id)).capabilities(caps).decoder(make_decoder));
+    }
+}
+
+/// How a PCM id's bytes become those of the format it decodes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wire {
+    /// The decoded format's own (little-endian) bytes.
+    Native,
+    /// The decoded format's samples, big-endian.
+    BigEndian,
+    /// Offset-binary samples of the decoded format's width.
+    Unsigned { big_endian: bool },
+    /// Signed 64-bit integers, decoded to 64-bit float.
+    S64 { big_endian: bool },
+    /// D-Cinema 24-bit big-endian words: 4 flag bits, 16 audio bits
+    /// least-significant first, 4 flag bits; decoded to signed 16-bit.
+    Daud,
+}
+
+/// The PCM ids decoded but not encoded here, with the format each decodes
+/// to and its wire layout.
+const DECODE_ONLY: &[(&str, SampleFormat, Wire)] = &[
+    ("pcm_s16be", SampleFormat::S16, Wire::BigEndian),
+    ("pcm_s24be", SampleFormat::S24, Wire::BigEndian),
+    ("pcm_s32be", SampleFormat::S32, Wire::BigEndian),
+    ("pcm_f32be", SampleFormat::F32, Wire::BigEndian),
+    ("pcm_f64be", SampleFormat::F64, Wire::BigEndian),
+    ("pcm_u16le", SampleFormat::S16, Wire::Unsigned { big_endian: false }),
+    ("pcm_u16be", SampleFormat::S16, Wire::Unsigned { big_endian: true }),
+    ("pcm_u24le", SampleFormat::S24, Wire::Unsigned { big_endian: false }),
+    ("pcm_u24be", SampleFormat::S24, Wire::Unsigned { big_endian: true }),
+    ("pcm_u32le", SampleFormat::S32, Wire::Unsigned { big_endian: false }),
+    ("pcm_u32be", SampleFormat::S32, Wire::Unsigned { big_endian: true }),
+    ("pcm_s64le", SampleFormat::F64, Wire::S64 { big_endian: false }),
+    ("pcm_s64be", SampleFormat::F64, Wire::S64 { big_endian: true }),
+    ("pcm_s24daud", SampleFormat::S16, Wire::Daud),
+];
+
+/// The format a PCM id decodes to and its wire layout.
+fn decode_layout(id: &CodecId) -> Option<(SampleFormat, Wire)> {
+    if let Some(format) = sample_format_for(id) {
+        return Some((format, Wire::Native));
+    }
+    DECODE_ONLY.iter().find(|(name, ..)| *name == id.as_str()).map(|&(_, format, wire)| (format, wire))
+}
+
+impl Wire {
+    /// Bytes a sample takes on the wire.
+    fn width(self, decoded: SampleFormat) -> usize {
+        match self {
+            Wire::S64 { .. } => 8,
+            Wire::Daud => 3,
+            _ => decoded.bytes_per_sample(),
+        }
+    }
+
+    /// Converts whole samples in place to the decoded format's bytes.
+    fn decode(self, decoded: SampleFormat, data: &mut Vec<u8>) {
+        let width = self.width(decoded);
+        match self {
+            Wire::Native => {}
+            Wire::BigEndian => data.chunks_exact_mut(width).for_each(<[u8]>::reverse),
+            Wire::Unsigned { big_endian } => {
+                for sample in data.chunks_exact_mut(width) {
+                    if big_endian {
+                        sample.reverse();
+                    }
+                    sample[width - 1] ^= 0x80;
+                }
+            }
+            Wire::S64 { big_endian } => {
+                for sample in data.chunks_exact_mut(8) {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(sample);
+                    let v = if big_endian { i64::from_be_bytes(bytes) } else { i64::from_le_bytes(bytes) };
+                    sample.copy_from_slice(&(v as f64 / 9_223_372_036_854_775_808.0).to_le_bytes());
+                }
+            }
+            Wire::Daud => {
+                // Each 2-byte result lands before the 3-byte word it came
+                // from, at or after the end of the ones already read.
+                let words = data.len() / 3;
+                for i in 0..words {
+                    let word = u32::from(data[3 * i]) << 16 | u32::from(data[3 * i + 1]) << 8 | u32::from(data[3 * i + 2]);
+                    let sample = ((word >> 4) as u16).reverse_bits().to_le_bytes();
+                    data[2 * i..2 * i + 2].copy_from_slice(&sample);
+                }
+                data.truncate(2 * words);
+            }
+        }
     }
 }
 
@@ -196,18 +303,20 @@ pub fn codec_id_for(fmt: SampleFormat) -> Option<CodecId> {
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let format = sample_format_for(&params.codec_id)
+    let (format, wire) = decode_layout(&params.codec_id)
         .ok_or_else(|| Error::CodecNotFound(params.codec_id.to_string()))?;
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("PCM decoder requires channels"))?;
-    params
+    let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("PCM decoder requires sample_rate"))?;
     Ok(Box::new(PcmDecoder {
         id: params.codec_id.clone(),
         format,
+        wire,
         channels,
+        sample_rate,
         pending: None,
         eof: false,
     }))
@@ -237,7 +346,9 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 struct PcmDecoder {
     id: CodecId,
     format: SampleFormat,
+    wire: Wire,
     channels: u16,
+    sample_rate: u32,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -258,19 +369,19 @@ impl Decoder for PcmDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.take() else {
+        let Some(mut pkt) = self.pending.take() else {
             return if self.eof {
                 Err(Error::Eof)
             } else {
                 Err(Error::NeedMore)
             };
         };
-        let bps = self.format.bytes_per_sample();
-        let block = bps * self.channels as usize;
+        let block = self.wire.width(self.format) * self.channels as usize;
         if block == 0 || pkt.data.len() % block != 0 {
             return Err(Error::invalid("PCM packet size not a multiple of block"));
         }
         let samples = (pkt.data.len() / block) as u32;
+        self.wire.decode(self.format, &mut pkt.data);
         Ok(Frame::Audio(AudioFrame {
             samples,
             pts: pkt.pts,
@@ -281,6 +392,10 @@ impl Decoder for PcmDecoder {
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn output_audio_format(&self) -> Option<AudioFormat> {
+        Some(AudioFormat { sample_format: self.format, sample_rate: self.sample_rate, channels: self.channels })
     }
 }
 
